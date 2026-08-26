@@ -5,23 +5,36 @@ controller="0000:00:15.1"
 device="/sys/bus/pci/devices/$controller"
 driver="/sys/bus/pci/drivers/intel-lpss"
 
-# Check if PCI device exists
 if [ ! -d "$device" ]; then
     echo "Controller $controller does not exist." >&2
     exit 0
 fi
 
-# Function to check if touchscreen is fully registered
-is_touchscreen_ready() {
-    if [ -d "/sys/bus/i2c/devices/i2c-FTSC1000:00" ] && \
-       [ -L "/sys/bus/i2c/devices/i2c-FTSC1000:00/driver" ]; then
-        for inp in /sys/bus/i2c/devices/i2c-FTSC1000:00/0018:2808:5662.*/input/input*; do
-            if [ -d "$inp" ]; then
-                return 0
-            fi
-        done
+is_touchscreen_healthy() {
+    # Check if FTSC1000 i2c device has an active driver and registered input device
+    if [ ! -d "/sys/bus/i2c/devices/i2c-FTSC1000:00" ] ||        [ ! -L "/sys/bus/i2c/devices/i2c-FTSC1000:00/driver" ]; then
+        return 1
     fi
-    return 1
+
+    # Check if input device node exists
+    found_input=0
+    for inp in /sys/bus/i2c/devices/i2c-FTSC1000:00/0018:2808:5662.*/input/input*; do
+        if [ -d "$inp" ]; then
+            found_input=1
+            break
+        fi
+    done
+
+    if [ "$found_input" -eq 0 ]; then
+        return 1
+    fi
+
+    # Check recent kernel messages for fatal I2C arbitration loss or device error -5
+    if dmesg 2>/dev/null | tail -n 25 | grep -q -E "(i2c_designware.*lost arbitration|i2c_hid_acpi.*failed to get a report from device: -5|failed to fetch HID descriptor)"; then
+        return 1
+    fi
+
+    return 0
 }
 
 reset_controller() {
@@ -35,7 +48,7 @@ reset_controller() {
         fi
     fi
 
-    # Wait for power state to settle
+    # Wait for power state and I2C lines to completely settle
     sleep 2
 
     # Bind controller
@@ -44,21 +57,19 @@ reset_controller() {
         return 1
     fi
 
-    # Give the I2C bus and driver time to probe and attach
-    for i in 1 2 3 4 5 6; do
-        sleep 0.5
-        if is_touchscreen_ready; then
-            echo "Touchscreen successfully initialized."
-            return 0
-        fi
-    done
+    # Allow I2C probe and HID handshake to complete
+    sleep 1.5
 
-    echo "Touchscreen failed to initialize properly." >&2
+    if is_touchscreen_healthy; then
+        echo "Touchscreen successfully initialized and healthy."
+        return 0
+    fi
+
+    echo "Touchscreen failed probe health check." >&2
     return 1
 }
 
-# Try up to 3 times
-max_retries=3
+max_retries=4
 attempt=1
 
 while [ "$attempt" -le "$max_retries" ]; do
@@ -68,7 +79,7 @@ while [ "$attempt" -le "$max_retries" ]; do
         exit 0
     fi
     attempt=$((attempt + 1))
-    sleep 1
+    sleep 2
 done
 
 echo "Touchscreen reset failed after $max_retries attempts." >&2
