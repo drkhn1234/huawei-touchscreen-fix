@@ -1,0 +1,7 @@
+#!/bin/sh
+# Reset Huawei MateBook touchscreen I2C controller on wake/resume
+case "$1" in
+  post)
+    /usr/local/sbin/huawei-touchscreen-reset
+    ;;
+esac

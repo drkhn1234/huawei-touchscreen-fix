@@ -1,0 +1,75 @@
+#!/bin/sh
+set -eu
+
+controller="0000:00:15.1"
+device="/sys/bus/pci/devices/$controller"
+driver="/sys/bus/pci/drivers/intel-lpss"
+
+# Check if PCI device exists
+if [ ! -d "$device" ]; then
+    echo "Controller $controller does not exist." >&2
+    exit 0
+fi
+
+# Function to check if touchscreen is fully registered
+is_touchscreen_ready() {
+    if [ -d "/sys/bus/i2c/devices/i2c-FTSC1000:00" ] && \
+       [ -L "/sys/bus/i2c/devices/i2c-FTSC1000:00/driver" ]; then
+        for inp in /sys/bus/i2c/devices/i2c-FTSC1000:00/0018:2808:5662.*/input/input*; do
+            if [ -d "$inp" ]; then
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
+reset_controller() {
+    echo "Resetting touchscreen controller $controller..."
+    
+    # If bound, unbind first
+    if [ -L "$device/driver" ]; then
+        current_driver=$(readlink -f "$device/driver")
+        if [ "$current_driver" = "$driver" ]; then
+            printf "%s" "$controller" > "$driver/unbind" 2>/dev/null || true
+        fi
+    fi
+
+    # Wait for power state to settle
+    sleep 2
+
+    # Bind controller
+    if ! printf "%s" "$controller" > "$driver/bind" 2>/dev/null; then
+        echo "Failed to write to $driver/bind" >&2
+        return 1
+    fi
+
+    # Give the I2C bus and driver time to probe and attach
+    for i in 1 2 3 4 5 6; do
+        sleep 0.5
+        if is_touchscreen_ready; then
+            echo "Touchscreen successfully initialized."
+            return 0
+        fi
+    done
+
+    echo "Touchscreen failed to initialize properly." >&2
+    return 1
+}
+
+# Try up to 3 times
+max_retries=3
+attempt=1
+
+while [ "$attempt" -le "$max_retries" ]; do
+    echo "Touchscreen reset attempt $attempt of $max_retries..."
+    if reset_controller; then
+        udevadm settle --timeout=5 2>/dev/null || true
+        exit 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+
+echo "Touchscreen reset failed after $max_retries attempts." >&2
+exit 1
