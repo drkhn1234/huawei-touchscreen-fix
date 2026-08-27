@@ -1,13 +1,14 @@
 [Unit]
 Description=Reset Huawei MateBook 14 touchscreen I2C controller
-After=display-manager.service graphical.target
-Wants=display-manager.service
+After=systemd-modules-load.service local-fs.target
+Before=graphical.target
 ConditionPathExists=/sys/bus/pci/devices/0000:00:15.1
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/huawei-touchscreen-reset
+TimeoutStartSec=45
 RemainAfterExit=yes
 
 [Install]
-WantedBy=graphical.target
+WantedBy=multi-user.target

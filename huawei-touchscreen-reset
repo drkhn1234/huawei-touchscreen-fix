@@ -1,81 +1,64 @@
 #!/bin/sh
 set -eu
 
-controller="0000:00:15.1"
-device="/sys/bus/pci/devices/$controller"
-driver="/sys/bus/pci/drivers/intel-lpss"
+hid_module="i2c_hid_acpi"
+touch_device="/sys/bus/i2c/devices/i2c-FTSC1000:00"
+controller_power="/sys/bus/pci/devices/0000:00:15.1/power/control"
+lock_file="/run/lock/huawei-touchscreen-reset.lock"
 
-if [ ! -d "$device" ]; then
-    echo "Controller $controller does not exist." >&2
-    exit 0
-fi
+# Boot and resume hooks can overlap.  Never reset the shared I2C-HID stack twice.
+exec 9>"$lock_file"
+flock -n 9 || exit 0
 
-is_touchscreen_healthy() {
-    # Check if FTSC1000 i2c device has an active driver and registered input device
-    if [ ! -d "/sys/bus/i2c/devices/i2c-FTSC1000:00" ] ||        [ ! -L "/sys/bus/i2c/devices/i2c-FTSC1000:00/driver" ]; then
-        return 1
-    fi
+is_touchscreen_present() {
+    [ -d "$touch_device" ] || return 1
+    [ -L "$touch_device/driver" ] || return 1
 
-    # Check if input device node exists
-    found_input=0
-    for inp in /sys/bus/i2c/devices/i2c-FTSC1000:00/0018:2808:5662.*/input/input*; do
-        if [ -d "$inp" ]; then
-            found_input=1
-            break
-        fi
+    for inp in "$touch_device"/0018:2808:5662.*/input/input*; do
+        [ -d "$inp" ] && return 0
     done
 
-    if [ "$found_input" -eq 0 ]; then
-        return 1
-    fi
-
-    # Check recent kernel messages for fatal I2C arbitration loss or device error -5
-    if dmesg 2>/dev/null | tail -n 25 | grep -q -E "(i2c_designware.*lost arbitration|i2c_hid_acpi.*failed to get a report from device: -5|failed to fetch HID descriptor)"; then
-        return 1
-    fi
-
-    return 0
-}
-
-reset_controller() {
-    echo "Resetting touchscreen controller $controller..."
-    
-    # If bound, unbind first
-    if [ -L "$device/driver" ]; then
-        current_driver=$(readlink -f "$device/driver")
-        if [ "$current_driver" = "$driver" ]; then
-            printf "%s" "$controller" > "$driver/unbind" 2>/dev/null || true
-        fi
-    fi
-
-    # Wait for power state and I2C lines to completely settle
-    sleep 2
-
-    # Bind controller
-    if ! printf "%s" "$controller" > "$driver/bind" 2>/dev/null; then
-        echo "Failed to write to $driver/bind" >&2
-        return 1
-    fi
-
-    # Allow I2C probe and HID handshake to complete
-    sleep 1.5
-
-    if is_touchscreen_healthy; then
-        echo "Touchscreen successfully initialized and healthy."
-        return 0
-    fi
-
-    echo "Touchscreen failed probe health check." >&2
     return 1
 }
 
-max_retries=4
+reload_i2c_hid() {
+    echo "Reloading $hid_module for the FTSC1000 touchscreen..."
+
+    # Runtime-suspending this controller leaves the digitizer enumerated but
+    # unable to deliver reports on this Huawei firmware.  Keep this controller
+    # awake; the neighboring touchpad controller remains power-managed.
+    if [ -w "$controller_power" ]; then
+        printf "on" > "$controller_power"
+    fi
+
+    # The FTSC1000 controller can remain electrically wedged after a failed
+    # probe.  Rebinding only intel-lpss recreates the input node but does not
+    # reset the HID handshake.  Reloading the ACPI I2C-HID driver does.
+    modprobe -r "$hid_module"
+    sleep 2
+    modprobe "$hid_module"
+    udevadm settle --timeout=5 2>/dev/null || true
+
+    attempt=1
+    while [ "$attempt" -le 10 ]; do
+        if is_touchscreen_present; then
+            echo "Touchscreen input device initialized."
+            return 0
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+
+    echo "Touchscreen input device did not reappear." >&2
+    return 1
+}
+
+max_retries=3
 attempt=1
 
 while [ "$attempt" -le "$max_retries" ]; do
     echo "Touchscreen reset attempt $attempt of $max_retries..."
-    if reset_controller; then
-        udevadm settle --timeout=5 2>/dev/null || true
+    if reload_i2c_hid; then
         exit 0
     fi
     attempt=$((attempt + 1))
