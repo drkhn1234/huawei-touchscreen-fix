@@ -2,8 +2,13 @@
 set -eu
 
 hid_module="i2c_hid_acpi"
+multitouch_module="hid_multitouch"
 touch_device="/sys/bus/i2c/devices/i2c-FTSC1000:00"
 controller_power="/sys/bus/pci/devices/0000:00:15.1/power/control"
+controller_driver="/sys/bus/pci/drivers/intel-lpss"
+controller_device="0000:00:15.1"
+als_driver="/sys/bus/acpi/drivers/acpi_als"
+als_device="ACPI0008:00"
 lock_file="/run/lock/huawei-touchscreen-reset.lock"
 
 # Boot and resume hooks can overlap.  Never reset the shared I2C-HID stack twice.
@@ -24,6 +29,15 @@ is_touchscreen_present() {
 reload_i2c_hid() {
     echo "Reloading $hid_module for the FTSC1000 touchscreen..."
 
+    # On this Huawei firmware the ambient-light sensor and FTSC1000 share an
+    # I2C controller whose startup ordering can lose arbitration.  Leaving
+    # the ALS bound makes the HID reload intermittently enumerate a dead
+    # touchscreen, so disable only that optional sensor before re-probing.
+    if [ -e "$als_driver/$als_device" ]; then
+        echo "Unbinding the ambient-light sensor to avoid the Huawei I2C race..."
+        printf "%s" "$als_device" > "$als_driver/unbind"
+    fi
+
     # Runtime-suspending this controller leaves the digitizer enumerated but
     # unable to deliver reports on this Huawei firmware.  Keep this controller
     # awake; the neighboring touchpad controller remains power-managed.
@@ -32,11 +46,23 @@ reload_i2c_hid() {
     fi
 
     # The FTSC1000 controller can remain electrically wedged after a failed
-    # probe.  Rebinding only intel-lpss recreates the input node but does not
-    # reset the HID handshake.  Reloading the ACPI I2C-HID driver does.
+    # probe.  Remove the HID consumers, reset only the PCI I2C controller,
+    # then reload hid-multitouch and the ACPI I2C-HID layer so the descriptor
+    # is fetched from a clean stack.
+    modprobe -r "$multitouch_module"
     modprobe -r "$hid_module"
     sleep 2
+
+    if [ -e "$controller_driver/$controller_device" ]; then
+        echo "Resetting the dedicated touchscreen I2C controller..."
+        printf "%s" "$controller_device" > "$controller_driver/unbind"
+        sleep 2
+        printf "%s" "$controller_device" > "$controller_driver/bind"
+        sleep 2
+    fi
+
     modprobe "$hid_module"
+    modprobe "$multitouch_module"
     udevadm settle --timeout=5 2>/dev/null || true
 
     attempt=1

@@ -9,9 +9,11 @@ Huawei MateBook laptops equipped with the **FocalTech FTSC1000** I2C digitizer o
 ## Solution
 
 This repository provides:
-1. **`huawei-touchscreen-reset`**: A reset script that safely unbinds and rebinds the dedicated Intel LPSS I2C controller (`0000:00:15.1`) without interfering with the touchpad controller (`0000:00:15.0`), verifies successful I2C input attachment, and retries automatically if needed.
+1. **`huawei-touchscreen-reset`**: A reset script that disables the problematic optional ambient-light sensor, reloads the HID stack, resets the dedicated Intel LPSS I2C controller (`0000:00:15.1`) without touching the touchpad controller (`0000:00:15.0`), verifies successful I2C input attachment, and retries automatically if needed.
 2. **`huawei-touchscreen-reset.service`**: A systemd unit that runs on system boot.
 3. **`huawei-touchscreen-reset.sleep`**: A systemd-sleep hook in `/usr/lib/systemd/system-sleep/` that automatically reinitializes the digitizer when resuming from sleep or hibernation.
+
+The ambient-light sensor (`ACPI0008:00`) is intentionally unbound because this Huawei firmware can race the touchscreen during I2C initialization. Automatic-brightness support may therefore be unavailable while the workaround is active.
 
 ## Installation
 
@@ -38,4 +40,14 @@ systemctl status huawei-touchscreen-reset.service
 Verify the input device in libinput or evtest:
 ```bash
 sudo libinput list-devices | grep -A 8 "FTSC1000"
+```
+
+For Niri, map the touchscreen to the built-in panel in `~/.config/niri/config.kdl`:
+
+```kdl
+input {
+    touch {
+        map-to-output "eDP-1"
+    }
+}
 ```
