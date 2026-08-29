@@ -1,7 +1,11 @@
 #!/bin/sh
-# Reset Huawei MateBook touchscreen I2C controller on wake/resume
+# Detach only the display touchscreen before sleep and reattach it after the
+# dedicated I2C bus has resumed. The BLTP7853 touchpad is never unbound.
 case "$1" in
+  pre)
+    /usr/local/sbin/huawei-touchscreen-reset suspend
+    ;;
   post)
-    /usr/local/sbin/huawei-touchscreen-reset
+    /usr/local/sbin/huawei-touchscreen-reset resume
     ;;
 esac

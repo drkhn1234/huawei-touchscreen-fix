@@ -9,9 +9,9 @@ Huawei MateBook laptops equipped with the **FocalTech FTSC1000** I2C digitizer o
 ## Solution
 
 This repository provides:
-1. **`huawei-touchscreen-reset`**: A reset script that disables the problematic optional ambient-light sensor, reloads the HID stack, resets the dedicated Intel LPSS I2C controller (`0000:00:15.1`) without touching the touchpad controller (`0000:00:15.0`), verifies successful I2C input attachment, and retries automatically if needed.
+1. **`huawei-touchscreen-reset`**: A reset script that disables the problematic optional ambient-light sensor, keeps both the parent PCI device and the actual touchscreen I2C bus (`i2c_designware.1`) runtime-active, rebinds only the FTSC1000 display touchscreen, verifies that libinput identifies a touchscreen event node, and retries automatically if needed. It never unloads the shared I2C-HID stack or disconnects the BLTP7853 touchpad.
 2. **`huawei-touchscreen-reset.service`**: A systemd unit that runs on system boot.
-3. **`huawei-touchscreen-reset.sleep`**: A systemd-sleep hook in `/usr/lib/systemd/system-sleep/` that automatically reinitializes the digitizer when resuming from sleep or hibernation.
+3. **`huawei-touchscreen-reset.sleep`**: A systemd-sleep hook in `/usr/lib/systemd/system-sleep/` that detaches only the FTSC1000 before sleep and reattaches it after a short post-resume settling delay. This avoids racing the kernel's own I2C resume path.
 
 The ambient-light sensor (`ACPI0008:00`) is intentionally unbound because this Huawei firmware can race the touchscreen during I2C initialization. Automatic-brightness support may therefore be unavailable while the workaround is active.
 

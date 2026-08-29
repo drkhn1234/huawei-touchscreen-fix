@@ -21,7 +21,4 @@ echo "==> Reloading systemd and enabling service..."
 systemctl daemon-reload
 systemctl enable --now huawei-touchscreen-reset.service
 
-echo "==> Testing touchscreen reset..."
-/usr/local/sbin/huawei-touchscreen-reset
-
 echo "==> Installation complete!"
