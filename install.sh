@@ -11,14 +11,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "==> Installing huawei-touchscreen-reset executable..."
 install -m 0755 "${SCRIPT_DIR}/huawei-touchscreen-reset" /usr/local/sbin/huawei-touchscreen-reset
 
-echo "==> Installing systemd service..."
+echo "==> Installing systemd service for boot..."
 install -m 0644 "${SCRIPT_DIR}/huawei-touchscreen-reset.service" /etc/systemd/system/huawei-touchscreen-reset.service
 
 echo "==> Installing system-sleep resume hook..."
+mkdir -p /usr/lib/systemd/system-sleep
 install -m 0755 "${SCRIPT_DIR}/huawei-touchscreen-reset.sleep" /usr/lib/systemd/system-sleep/huawei-touchscreen-reset
 
 echo "==> Reloading systemd and enabling service..."
 systemctl daemon-reload
-systemctl enable --now huawei-touchscreen-reset.service
+systemctl enable huawei-touchscreen-reset.service
+
+echo "==> Testing touchscreen reset..."
+/usr/local/sbin/huawei-touchscreen-reset
 
 echo "==> Installation complete!"

@@ -1,139 +1,212 @@
 #!/bin/sh
 set -eu
 
-touch_device_id="i2c-FTSC1000:00"
-touch_device="/sys/bus/i2c/devices/$touch_device_id"
-touch_driver="/sys/bus/i2c/drivers/i2c_hid_acpi"
-pci_controller_power="/sys/bus/pci/devices/0000:00:15.1/power"
-bus_controller_power="/sys/bus/platform/devices/i2c_designware.1/power"
-als_driver="/sys/bus/acpi/drivers/acpi_als"
-als_device="ACPI0008:00"
+touch_device="/sys/bus/i2c/devices/i2c-FTSC1000:00"
+pci_controller="0000:00:15.1"
+pci_device="/sys/bus/pci/devices/$pci_controller"
+pci_driver="/sys/bus/pci/drivers/intel-lpss"
+pci_controller_power="$pci_device/power/control"
+bus_controller_power="/sys/bus/platform/devices/i2c_designware.1/power/control"
 lock_file="/run/lock/huawei-touchscreen-reset.lock"
 
-# Boot and sleep hooks can overlap. Wait for the in-flight touchscreen-only
-# operation instead of silently skipping recovery.
+# Never reset concurrently
 exec 9>"$lock_file"
-flock -w 30 9 || {
-    echo "Timed out waiting for another touchscreen recovery." >&2
-    exit 1
-}
+flock -w 30 9 || exit 0
 
-keep_touchscreen_bus_awake() {
-    for power_dir in "$pci_controller_power" "$bus_controller_power"; do
-        if [ -w "$power_dir/control" ]; then
-            printf "on" > "$power_dir/control"
-        fi
-    done
-}
-
-disable_ambient_light_sensor() {
-    # The optional ALS can contend with the FTSC1000 during initialization on
-    # this firmware. It is intentionally left unbound by this workaround.
-    if [ -e "$als_driver/$als_device" ]; then
-        echo "Unbinding the ambient-light sensor to avoid the Huawei I2C race..."
-        printf "%s" "$als_device" > "$als_driver/unbind"
+keep_controllers_awake() {
+    if [ -w "$pci_controller_power" ]; then
+        printf "on" > "$pci_controller_power" 2>/dev/null || true
+    fi
+    if [ -w "$bus_controller_power" ]; then
+        printf "on" > "$bus_controller_power" 2>/dev/null || true
     fi
 }
 
-is_touchscreen_present() {
+is_touchscreen_healthy() {
+    bind_start="${1:-0}"
+
     [ -d "$touch_device" ] || return 1
     [ -L "$touch_device/driver" ] || return 1
-    [ "$(cat "$pci_controller_power/control" 2>/dev/null || true)" = "on" ] || return 1
-    [ "$(cat "$bus_controller_power/control" 2>/dev/null || true)" = "on" ] || return 1
-    [ "$(cat "$bus_controller_power/runtime_status" 2>/dev/null || true)" = "active" ] || return 1
 
-    for input_dir in "$touch_device"/0018:2808:5662.*/input/input*; do
-        [ -d "$input_dir" ] || continue
-        for event_node in "$input_dir"/event*; do
-            [ -e "$event_node" ] || continue
-            event_name=$(basename "$event_node")
-            [ -e "/dev/input/$event_name" ] || continue
-            if udevadm info --query=property --name="/dev/input/$event_name" 2>/dev/null |
-                grep -qx 'ID_INPUT_TOUCHSCREEN=1'; then
-                return 0
+    # Verify HID device is bound to hid-multitouch (not hid-generic fallback)
+    found_multitouch=0
+    for dev in "$touch_device"/0018:2808:5662.*; do
+        [ -d "$dev" ] || continue
+        if [ -L "$dev/driver" ]; then
+            driver_name=$(basename "$(readlink -f "$dev/driver" 2>/dev/null || true)")
+            if [ "$driver_name" = "hid-multitouch" ]; then
+                found_multitouch=1
+                break
             fi
+        fi
+    done
+    [ "$found_multitouch" -eq 1 ] || return 1
+
+    # Verify input device and char event node exist and can be accessed
+    found_node=0
+    for dev in "$touch_device"/0018:2808:5662.*; do
+        [ -d "$dev" ] || continue
+        for inp in "$dev"/input/input*; do
+            [ -d "$inp" ] || continue
+            for ev in "$inp"/event*; do
+                [ -e "$ev" ] || continue
+                ev_name=$(basename "$ev")
+                if [ -c "/dev/input/$ev_name" ]; then
+                    found_node=1
+                    break 3
+                fi
+            done
         done
     done
+    [ "$found_node" -eq 1 ] || return 1
 
-    return 1
-}
-
-unbind_touchscreen() {
-    if [ -L "$touch_device/driver" ]; then
-        echo "Unbinding only the FTSC1000 display touchscreen..."
-        printf "%s" "$touch_device_id" > "$touch_driver/unbind"
-        udevadm settle --timeout=5 2>/dev/null || true
+    # Verify no corrupted report descriptor or fatal bus errors occurred during this bind
+    if [ "$bind_start" != "0" ]; then
+        if dmesg 2>/dev/null | awk -v start="$bind_start" '
+            match($0, /^\[ *([0-9]+\.[0-9]+)\]/, m) {
+                t = m[1] + 0;
+                if (t >= start) {
+                    if ($0 ~ /(lost arbitration|failed to get a report from device: -(5|121)|failed to fetch feature 5|failed to fetch HID descriptor|failed to reset device)/) {
+                        if ($0 ~ /(FTSC1000|i2c_designware\.1|2808:5662)/) {
+                            found = 1;
+                        }
+                    }
+                }
+            }
+            END { exit (found ? 1 : 0) }
+        '; then
+            : # Clean
+        else
+            echo "Corrupt HID report descriptor or communication error detected in dmesg; probe failed." >&2
+            return 1
+        fi
     fi
+
+    return 0
 }
 
-bind_touchscreen() {
-    modprobe i2c_hid_acpi
-    keep_touchscreen_bus_awake
+reset_intel_lpss() {
+    echo "Rebinding dedicated Intel LPSS I2C controller $pci_controller..."
+    keep_controllers_awake
+    bind_start=$(awk '{print $1}' /proc/uptime 2>/dev/null || echo "0")
 
-    if [ ! -L "$touch_device/driver" ]; then
-        printf "%s" "$touch_device_id" > "$touch_driver/bind"
+    if [ -L "$pci_device/driver" ]; then
+        current_driver=$(readlink -f "$pci_device/driver" 2>/dev/null || true)
+        if [ "$current_driver" = "$pci_driver" ]; then
+            printf "%s" "$pci_controller" > "$pci_driver/unbind" 2>/dev/null || true
+        fi
+    fi
+
+    sleep 2
+
+    if ! printf "%s" "$pci_controller" > "$pci_driver/bind" 2>/dev/null; then
+        echo "Failed to bind to $pci_driver" >&2
+        return 1
     fi
 
     udevadm settle --timeout=5 2>/dev/null || true
-    keep_touchscreen_bus_awake
-
-    check=1
-    while [ "$check" -le 10 ]; do
-        if is_touchscreen_present; then
-            echo "Display touchscreen input device initialized; touchpad was not reset."
-            return 0
-        fi
-        sleep 1
-        check=$((check + 1))
-    done
-
-    echo "Display touchscreen input device did not initialize." >&2
-    return 1
-}
-
-recover_touchscreen() {
-    initial_delay=${1:-0}
-    disable_ambient_light_sensor
-    keep_touchscreen_bus_awake
-
-    if [ "$initial_delay" -gt 0 ]; then
-        echo "Waiting ${initial_delay}s for the touchscreen bus to settle..."
-        sleep "$initial_delay"
-    fi
+    keep_controllers_awake
 
     attempt=1
-    while [ "$attempt" -le 3 ]; do
-        echo "Display touchscreen recovery attempt $attempt of 3..."
-        unbind_touchscreen
-        sleep 2
-        keep_touchscreen_bus_awake
-        if bind_touchscreen; then
+    while [ "$attempt" -le 8 ]; do
+        if is_touchscreen_healthy "$bind_start"; then
+            echo "Touchscreen input device initialized successfully via Intel LPSS rebind."
             return 0
         fi
+        sleep 0.5
         attempt=$((attempt + 1))
-        sleep 2
     done
 
-    echo "Display touchscreen recovery failed after 3 attempts." >&2
+    echo "Touchscreen input device did not initialize properly via Intel LPSS rebind." >&2
     return 1
 }
 
-case "${1:-recover}" in
-    suspend)
-        disable_ambient_light_sensor
-        keep_touchscreen_bus_awake
-        unbind_touchscreen
-        ;;
-    resume)
-        # The FTSC1000 is deliberately detached before suspend so the kernel
-        # cannot resume it while the Intel LPSS bus is still settling.
-        recover_touchscreen 2
-        ;;
-    recover)
-        recover_touchscreen 2
-        ;;
-    *)
-        echo "Usage: $0 [suspend|resume|recover]" >&2
-        exit 2
-        ;;
-esac
+reset_pci_rescan() {
+    echo "Power cycling and rescanning PCI device $pci_controller..."
+    keep_controllers_awake
+    bind_start=$(awk '{print $1}' /proc/uptime 2>/dev/null || echo "0")
+
+    echo "i2c-FTSC1000:00" > /sys/bus/i2c/drivers/i2c_hid_acpi/unbind 2>/dev/null || true
+    echo "i2c_designware.1" > /sys/bus/platform/drivers/i2c_designware/unbind 2>/dev/null || true
+    if [ -w "$pci_device/remove" ]; then
+        echo 1 > "$pci_device/remove" 2>/dev/null || true
+    fi
+    sleep 1
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null || true
+    sleep 2
+    keep_controllers_awake
+
+    attempt=1
+    while [ "$attempt" -le 8 ]; do
+        if is_touchscreen_healthy "$bind_start"; then
+            echo "Touchscreen input device initialized successfully via PCI rescan."
+            return 0
+        fi
+        sleep 0.5
+        attempt=$((attempt + 1))
+    done
+
+    echo "Touchscreen input device did not initialize properly via PCI rescan." >&2
+    return 1
+}
+
+reload_modules() {
+    echo "Reloading I2C HID modules as fallback..."
+    keep_controllers_awake
+    bind_start=$(awk '{print $1}' /proc/uptime 2>/dev/null || echo "0")
+
+    modprobe -r hid_multitouch 2>/dev/null || true
+    modprobe -r i2c_hid_acpi 2>/dev/null || true
+    sleep 2
+    modprobe i2c_hid_acpi
+    modprobe hid_multitouch
+    udevadm settle --timeout=5 2>/dev/null || true
+    keep_controllers_awake
+
+    attempt=1
+    while [ "$attempt" -le 8 ]; do
+        if is_touchscreen_healthy "$bind_start"; then
+            echo "Touchscreen input device initialized successfully via module reload."
+            return 0
+        fi
+        sleep 0.5
+        attempt=$((attempt + 1))
+    done
+
+    echo "Touchscreen input device did not initialize properly via module reload." >&2
+    return 1
+}
+
+echo "Waiting 2s for hardware and display power to settle..."
+sleep 2
+keep_controllers_awake
+
+# Attempt 1: Rebind Intel LPSS controller
+echo "Touchscreen reset attempt 1 (Intel LPSS rebind)..."
+if reset_intel_lpss; then
+    exit 0
+fi
+
+# Attempt 2: Rebind Intel LPSS controller again with slightly longer settle
+sleep 1
+echo "Touchscreen reset attempt 2 (Intel LPSS rebind retry)..."
+if reset_intel_lpss; then
+    exit 0
+fi
+
+# Attempt 3: PCI remove and rescan
+sleep 1
+echo "Touchscreen reset attempt 3 (PCI hardware rescan)..."
+if reset_pci_rescan; then
+    exit 0
+fi
+
+# Attempt 4: Module reload fallback
+sleep 1
+echo "Touchscreen reset attempt 4 (Kernel module reload fallback)..."
+if reload_modules; then
+    exit 0
+fi
+
+echo "Touchscreen reset failed after all attempts." >&2
+exit 1

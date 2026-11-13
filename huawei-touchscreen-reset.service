@@ -1,14 +1,14 @@
 [Unit]
-Description=Recover Huawei MateBook FTSC1000 display touchscreen
-After=systemd-modules-load.service local-fs.target
-Before=graphical.target
+Description=Reset Huawei MateBook 14 touchscreen I2C controller
+After=display-manager.service graphical.target
+Wants=display-manager.service
 ConditionPathExists=/sys/bus/pci/devices/0000:00:15.1
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/huawei-touchscreen-reset recover
-TimeoutStartSec=90
+ExecStart=/usr/local/sbin/huawei-touchscreen-reset
+TimeoutStartSec=60
 RemainAfterExit=yes
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
